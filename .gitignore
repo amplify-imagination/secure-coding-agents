@@ -1,0 +1,7 @@
+# generated demo lab (fake keys, recreated by setup-lab.sh)
+lab/
+
+# media / scratch
+*.mp4
+*.m4a
+.DS_Store
