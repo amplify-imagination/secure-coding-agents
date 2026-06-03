@@ -1,0 +1,11 @@
+model_list:
+  - model_name: local
+    litellm_params:
+      model: openai/local
+      api_base: http://host.docker.internal:1234/v1   # your LM Studio server
+      api_key: lm-studio
+general_settings:
+  # a small Postgres keeps the running spend tally so the cap actually enforces
+  database_url: "postgresql://litellm:litellm@localhost:5432/litellm"
+litellm_settings:
+  max_budget: 0.02   # a couple of cents — mint per-key budgets with /key/generate

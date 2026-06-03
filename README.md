@@ -54,6 +54,7 @@ Capability-first and tiered (low-risk → rootless container or dev container; c
 
 - **EP01 — The Blast Radius of an AI Coding Agent** (high-level): _link_
 - **EP01a — Cage Your AI Coding Agent** (walkthrough): _link_
+- **EP01c — Cage GitHub Copilot CLI** (BYOK + Podman, edit→diff→push): see [`ep01c-copilot-cli/`](ep01c-copilot-cli/)
 
 ## License
 
