@@ -1,37 +1,25 @@
 #!/usr/bin/env bash
-# cage — run GitHub Copilot CLI against a repo, inside the cage.
-#   Box:    real repo mounted read-only, agent edits a throwaway COPY, caps dropped, empty home (no keys).
-#   Brain:  your local model (LM Studio) via BYOK, offline.
-#   Camera: preToolUse hook mounted if present (logs + can deny).
-#   Meter:  routed through the LiteLLM budget gateway if it is running.
-# Usage: cage <repo-path> "<task prompt>"
+# cage — a caged GitHub Copilot session for a repo.
+#   read-only repo · throwaway sandbox copy · empty home (no keys) · caps dropped
+#   local model (BYOK, offline) · EGRESS LOCKED: can reach the model + approved hosts, nothing else.
+# Usage: cage [repo-path]
 set -euo pipefail
-REPO="${1:?usage: cage <repo-path> \"<task>\"}"; TASK="${2:?provide a task prompt}"
-REPO="$(cd "$REPO" && pwd)"
-WORK="$(mktemp -d)/work"; cp -r "$REPO" "$WORK"
-
-# read the loaded model id straight from the server
+REPO="$(cd "${1:-.}" && pwd)"
+WORK="$HOME/.cage/$(basename "$REPO")-work"; rm -rf "$WORK"; mkdir -p "$(dirname "$WORK")"; cp -r "$REPO" "$WORK"
 MODEL="$(curl -s http://localhost:1234/v1/models | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"][0]["id"])')"
 
-# Wall 5: prefer the metered gateway if it is up, else talk to the model directly
-if curl -sf http://localhost:4000/health >/dev/null 2>&1; then BASE=http://host.containers.internal:4000/v1; else BASE=http://host.containers.internal:1234/v1; fi
+# Wall: network. An --internal network has NO route out (enforced by routing, not a firewall).
+podman network exists cage-noegress 2>/dev/null || podman network create --internal cage-noegress >/dev/null
+# The allowlist = a relay that forwards ONLY the model. Add approved hosts here, nothing else gets out.
+if ! podman ps --filter name=cage-modelproxy --format '{{.Names}}' | grep -q cage-modelproxy; then
+  podman run -d --name cage-modelproxy --network cage-noegress --network podman \
+    -v "$(dirname "$0")/relay.js":/relay.js:ro --entrypoint node copilot-cage /relay.js >/dev/null
+fi
 
-# Wall 3b: mount the camera hook if you have one
-HOOK=(); [ -f "$(dirname "$0")/hooks/cage-hook.sh" ] && HOOK=(-v "$(dirname "$0")/hooks:/work/.copilot/hooks:ro")
-
-podman run --rm \
-  --userns=keep-id \
-  --tmpfs /home/agent --env HOME=/home/agent \
-  -v "$REPO":/src:ro \
-  -v "$WORK":/work -w /work \
-  --cap-drop=ALL \
-  "${HOOK[@]}" \
-  --env COPILOT_PROVIDER_BASE_URL="$BASE" \
-  --env COPILOT_PROVIDER_API_KEY=lm-studio \
-  --env COPILOT_MODEL="$MODEL" \
-  --env COPILOT_OFFLINE=true \
-  --entrypoint sh copilot-cage -c "copilot -p \"$TASK\" --allow-all"
-
-echo; echo "=== proposed diff (review, then: git -C \"$REPO\" apply <(...)) ==="
-( cd "$WORK" && git --no-pager diff )
-# NOTE: network egress lock (allow only the model/gateway + approved hosts) is a host firewall step — see NETWORK.md (WIP).
+exec podman run --rm -it \
+  --network cage-noegress \
+  --userns=keep-id --tmpfs /home/agent --env HOME=/home/agent \
+  -v "$REPO":/src:ro -v "$WORK":/work -w /work --cap-drop=ALL \
+  --env COPILOT_PROVIDER_BASE_URL=http://cage-modelproxy:1234/v1 \
+  --env COPILOT_PROVIDER_API_KEY=lm-studio --env COPILOT_MODEL="$MODEL" --env COPILOT_OFFLINE=true \
+  --entrypoint copilot copilot-cage

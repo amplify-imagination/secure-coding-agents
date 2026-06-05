@@ -1,13 +1,13 @@
 # Cage GitHub Copilot CLI against a real repo — full walkthrough
 
-Let an AI coding agent work on a real Git repo while it **cannot touch your real files, your keys, your network, or push anything**. The agent works on a throwaway copy and proposes a diff. *You* review it, apply it, and push — from outside the cage, where your credentials live.
+Let an AI coding agent work on a real Git repo while it **cannot touch your real files, your keys, or your network, and can't push anything**. The agent works on a throwaway copy and proposes a diff. *You* review it, apply it, and push — from outside the cage, where your credentials live.
 
-This is the loop shown in the video, every command verified on macOS (Apple Silicon) with Podman.
+Every command here is verified on macOS (Apple Silicon) with rootless Podman. It works the same on Linux.
 
 ```
-clone ──► throwaway copy ──► caged agent edits the copy ──► diff ──► (agent can't push) ──► you apply + commit + push ──► GitHub
-                 ▲                                                          ▲
-        your real repo stays read-only & untouched              your keys never enter the box
+clone ─► cage builds: read-only repo + throwaway copy + sealed network + relay-to-model only
+      └─► caged agent proposes a diff (writes nothing) ─► you apply + commit + push ─► GitHub
+            your real repo stays read-only           your keys never enter the box
 ```
 
 ---
@@ -15,15 +15,14 @@ clone ──► throwaway copy ──► caged agent edits the copy ──► di
 ## What you need (one-time)
 
 - **Podman** (rootless) — `brew install podman && podman machine init && podman machine start`
-- **A local model server** — [LM Studio](https://lmstudio.ai). Load a model that can actually edit code. A ~12B model (e.g. `gemma-4-12b`, or a coder like `Qwen2.5-Coder-7B`) makes clean edits; a ~4B model will mangle them. Give it a 32k context window (the agent's own prompt is large).
-- **GitHub Copilot CLI** — `npm install -g @github/copilot`. We run it in **BYOK** (bring-your-own-key) mode, so it needs **no GitHub login**.
-- **The cage image** — built below.
+- **A local model server** — [LM Studio](https://lmstudio.ai). Load a coder model and start its server on `:1234`. A dedicated coder like **Qwen2.5-Coder-7B** (used in the video) makes clean, reliable proposals; give it a 32k context window. A ~4B model will mangle edits.
+- **The cage image** — built below. It bundles **Node + the Copilot CLI and nothing else** — no `git`, no SSH, no credentials. That's what makes "the agent can't push" true by construction.
+
+> Copilot runs in **BYOK** (bring-your-own-key) mode pointed at your local model, so it needs **no GitHub login**.
 
 ---
 
 ## 0. Build the cage image (once)
-
-The image is deliberately minimal: **Node + the Copilot CLI, and nothing else** — no `git`, no SSH, no credentials. That's what makes "the agent can't push" true by construction, not by a rule.
 
 `Dockerfile`:
 
@@ -40,123 +39,140 @@ podman build -t copilot-cage .
 
 ---
 
-## 1. Get the repo (a normal developer clone)
+## 1. Start your local model
+
+In LM Studio, load a coder model and start its server, then confirm it's up:
 
 ```bash
-git clone https://github.com/you/your-repo.git ~/work/your-repo
+curl -s http://localhost:1234/v1/models   # note the model id it advertises
 ```
 
-This is your real repo, with its `.git` and history. It will stay **read-only and untouched** throughout.
+`cage` reads the model id from the server automatically — you never hardcode it.
 
-## 2. Make a throwaway working copy
+---
 
-The agent edits a *copy*, never your real clone:
+## 2. Run it: one command
 
 ```bash
-cp -r ~/work/your-repo ~/work/agent-work
+./cage example-repo
 ```
 
-## 3. Start the local model
+That single command raises every wall and drops you into the caged agent. Here is exactly what `cage` does, and why each part matters:
 
-In LM Studio: load your model and start its server (bind to all interfaces so the container can reach it):
-
-```bash
-lms load <your-model> --context-length 32768 --gpu max
-lms server start --bind 0.0.0.0
-# confirm the exact model id the server advertises:
-curl -s http://localhost:1234/v1/models
-```
-
-Note the `id` you get back (e.g. `google/gemma-4-12b`) — you'll pass it as `COPILOT_MODEL`.
-
-## 4. Run the caged agent
-
-```bash
-podman run --rm \
-  --userns=keep-id \
-  --tmpfs /home/agent --env HOME=/home/agent \
-  -v ~/work/your-repo:/src:ro \
-  -v ~/work/agent-work:/work \
-  -w /work \
-  --cap-drop=ALL \
-  --env COPILOT_PROVIDER_BASE_URL=http://host.containers.internal:1234/v1 \
-  --env COPILOT_PROVIDER_API_KEY=lm-studio \
-  --env COPILOT_MODEL=google/gemma-4-12b \
-  --env COPILOT_OFFLINE=true \
-  --entrypoint sh copilot-cage -c '
-    copilot -p "In runner.py, replace the unsafe os.system(cmd) in run_job with subprocess.run(shlex.split(cmd), check=True), and fix the imports. Use your edit tool to write and save the change." --allow-all
-  '
-```
-
-What each line does — these are the cage walls:
-
-| Flag | What it does |
+| Wall | How `cage` builds it |
 |---|---|
-| `--userns=keep-id` | container "root" maps to your unprivileged user, not real root |
-| `--tmpfs /home/agent` + `HOME=/home/agent` | an **empty, throwaway home** — no dotfiles, no keys to find |
-| `-v …/your-repo:/src:ro` | your real repo, mounted **read-only** for reference |
-| `-v …/agent-work:/work` | the **writable copy** — all edits land here, never in your real repo |
-| `--cap-drop=ALL` | drop every Linux capability |
-| `COPILOT_PROVIDER_BASE_URL=…host.containers.internal:1234` | point the agent at **your local model** (the host, seen from inside the container) |
-| `COPILOT_OFFLINE=true` | no telemetry, no phoning home, no GitHub login |
-| `--allow-all` | let the agent use its tools without interactive prompts (safe — it's caged) |
+| **Read-only repo** | mounts your repo at `/src:ro` — the agent can read it, never change it |
+| **Throwaway copy** | `cp -r` your repo to `~/.cage/<repo>-work`, mounted writable at `/work` — the only thing it can write to |
+| **Empty home** | `--tmpfs /home/agent` — no dotfiles, no SSH key, no token to find |
+| **No powers** | `--cap-drop=ALL` — every Linux capability dropped |
+| **Local brain, offline** | `COPILOT_PROVIDER_BASE_URL` → your model via the relay; `COPILOT_OFFLINE=true` |
+| **Sealed network** | runs on `cage-noegress`, an `--internal` Podman network with **no route out** |
+| **One allowed exit** | a relay container forwards **only** to your model — see below |
 
-> **Tip:** read the model id straight from the server so you never hardcode the wrong one:
-> `--env COPILOT_MODEL=$(curl -s http://localhost:1234/v1/models | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])")`
+---
 
-## 5. Get the diff (your real repo is still untouched)
+## 3. The network wall (the part most people skip)
 
-The agent edited the *copy*. Pull out exactly what it proposes:
+A `--cap-drop` flag is easy. The network is the wall that takes two moves, so `cage` builds it for you:
 
 ```bash
-git -C ~/work/agent-work --no-pager diff            # review it
-git -C ~/work/agent-work diff > /tmp/agent.patch    # save the patch
+# 1) a sealed network with no route out
+podman network create --internal cage-noegress
+
+# 2) a relay that forwards ONLY to your model — the single open door
+podman run -d --name cage-modelproxy --network cage-noegress --network podman \
+  -v ./relay.js:/relay.js:ro --entrypoint node copilot-cage /relay.js
 ```
 
-Confirm your real repo never changed:
+The entire allowlist is `relay.js` — seven lines that pipe to one address and nowhere else:
+
+```js
+const net = require("net");
+const [LPORT, RHOST, RPORT] = [1234, "host.containers.internal", 1234]; // the model, period
+net.createServer(c => {
+  const u = net.connect(RPORT, RHOST);
+  c.pipe(u); u.pipe(c);
+  u.on("error", () => c.destroy()); c.on("error", () => u.destroy());
+}).listen(LPORT);
+```
+
+**Prove it** — from *inside* the sealed network, the model answers and the open internet does not:
 
 ```bash
-git -C ~/work/your-repo status        # clean
+podman run --rm --network cage-noegress -v ./probe.js:/probe.js:ro \
+  --entrypoint node copilot-cage /probe.js
+#  the model (via relay)   reachable   HTTP 200
+#  the open internet       blocked     ENOTFOUND
+#  github.com              blocked     ENOTFOUND
 ```
 
-## 6. Prove the agent can't push (no keys in the box)
+Enforcement is by **routing, not a firewall**: there is simply no path out except the relay. To allow an approved tool host later, add another relay — nothing else gets out.
+
+---
+
+## 4. Talk to the agent
+
+Inside the session, tell it exactly what you want. With a small local model, a specific ask beats a vague one:
+
+```
+run_job in runner.py uses os.system, which is unsafe.
+Propose a minimal, safe diff — show me the change, don't rewrite anything else.
+```
+
+It reasons over the read-only code and **proposes a diff**. In propose mode it writes nothing — `Changes +0 -0` is correct, not a failure. The proposal is yours to judge.
+
+> Prefer it to write the change to the copy instead? Ask it to, then diff the copy on the host:
+> `git -C ~/.cage/example-repo-work diff`
+
+---
+
+## 5. Prove it can't push (no keys in the box)
 
 ```bash
 podman run --rm --userns=keep-id --tmpfs /home/agent --env HOME=/home/agent \
   --cap-drop=ALL --entrypoint sh copilot-cage -c '
     ls -A ~ ; ls ~/.ssh 2>&1 ; printenv | grep -iE "github|token" || echo "no token"
   '
-# → empty home, no ~/.ssh, no token. There is nothing to push with.
+# → empty home, no ~/.ssh, no token. There is nothing to authenticate with.
 ```
 
-## 7. You apply, commit, and push (outside the cage)
+The inability to push is a property of the cage, not a rule you're trusting the agent to follow.
 
-This half runs on your machine, where your credentials live — **you** are the one who presses merge:
+---
+
+## 6. You apply, commit, and push (outside the cage)
+
+This half runs on your machine, where your credentials live — **you** are the one who ships:
 
 ```bash
-cd ~/work/your-repo
-git apply /tmp/agent.patch
-git commit -am "fix: sandbox the job runner (reviewed agent diff)"
+cd example-repo
+git apply <the-proposed-diff>
+git commit -am "fix: sandbox the job runner (reviewed agent proposal)"
 git push
 ```
 
-## 8. Verify on GitHub
-
-The commit lands in your repo on github.com. The agent proposed it; you shipped it — and it never held the keys.
+The commit lands on GitHub. The agent proposed it; you shipped it — and it never held the keys.
 
 ---
 
 ## Why this is the whole point
 
-- **The agent runs as a stranger, not as you.** Empty home, dropped capabilities, read-only view of your code.
-- **It edits a copy, so "read-only" doesn't mean "useless."** You still get real changes — as a diff you control.
-- **It can't push because it has no credentials** — that's a consequence of the cage, not a rule you hope it follows.
-- **Pushing stays a human step.** The agent proposes; you review and commit.
+- **The agent runs as a stranger, not as you** — empty home, dropped capabilities, read-only view of your code.
+- **It edits a copy, so "read-only" still gets real work done** — you get changes as a diff you control.
+- **It can't reach the internet and can't push** — both are consequences of the cage, not promises.
+- **Shipping stays a human step.** The agent proposes; you review and commit.
 
 ## Gotchas (learned the hard way)
 
-- **The model has to be good enough to edit.** A ~4B model will leave stray characters or duplicate code. Use ~12B+ (or a dedicated coder) for clean edits.
-- **`git` is not in the cage image — on purpose.** Run all `git` commands on the host. The diff comes from the host-mounted working copy.
-- **`host.containers.internal`** is how the container reaches a model server running on your host (Podman/Docker on macOS).
-- Use `cp -r` (not `cp -a`) for the working copy — `-a` tries to preserve timestamps onto tmpfs and warns.
-- **Next wall:** lock the cage's network egress too (allow only your model + approved hosts), so a prompt-injected agent can't reach out even if it tries.
+- **Use a coder model.** Qwen2.5-Coder-7B gives clean proposals; a ~4B model leaves stray characters.
+- **Be specific.** A small local model anchors far better on "run_job uses os.system — propose a safe diff" than on "make it safer."
+- **`git` is not in the cage image — on purpose.** Run all `git` on the host.
+- **`host.containers.internal`** is how the relay reaches your host's model server (Podman/Docker).
+- **Never mount the Docker/Podman socket into the cage.** A socket mount equals host root — it hands the agent exactly the escape this cage exists to prevent.
+
+## Optional walls (in this repo)
+
+- `hooks/cage-hook.sh` + `hooks/cage.json` — a **preToolUse camera**: logs every tool call and can deny it.
+- `litellm_config.yaml` — a **budget gateway** that refuses past a hard spend cap.
+
+These aren't required for the loop above; they're the camera and cost walls from the series.
